@@ -5,9 +5,11 @@ extension) into plain-text Markdown files + a folder of extracted images.
 
 Usage
 -----
-    pip install beautifulsoup4 lxml
+    pip install beautifulsoup4 lxml          # core
+    pip install reportlab                    # only needed for --pdf
     python pat2md.py "Vulpes the fox.html" -o patterns/
     python pat2md.py "Vulpes the fox.html" -o patterns/ --photos "Vulpes the fox.json"
+    python pat2md.py "Vulpes the fox.html" -o patterns/ --pdf     # also writes vulpes-the-fox.pdf
 
 One page per run. Output layout:
 
@@ -515,6 +517,214 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
     return out_path, stats
 
 
+# --------------------------------------------------------------------------
+# PDF output (--pdf): rendered from the Markdown this script just wrote
+# --------------------------------------------------------------------------
+_FONT_CANDIDATES = [   # (regular, bold, italic, bold-italic) - first set that exists wins
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("/usr/share/fonts/dejavu/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("/usr/share/fonts/TTF/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("/Library/Fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("C:/Windows/Fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
+     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+]
+_PRIV = 0xE000   # private-use range used to protect backslash-escaped characters
+_GLYPHS = None   # set by _register_fonts(): characters the chosen font can draw
+
+
+def _register_fonts():
+    """Use DejaVu Sans if installed (covers symbols like the star bullets);
+    otherwise fall back to built-in Helvetica. Returns (family, unicode_ok)."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    for reg, b, i, bi in _FONT_CANDIDATES:
+        reg = Path(reg)
+        if reg.exists():
+            d = reg.parent
+            try:
+                pdfmetrics.registerFont(TTFont("PatSans", str(reg)))
+                names = {"normal": "PatSans"}
+                for key, fn, nm in (("bold", b, "PatSans-B"), ("italic", i, "PatSans-I"),
+                                    ("boldItalic", bi, "PatSans-BI")):
+                    f = d / fn
+                    pdfmetrics.registerFont(TTFont(nm, str(f if f.exists() else reg)))
+                    names[key] = nm
+                pdfmetrics.registerFontFamily("PatSans", **names)
+                global _GLYPHS
+                _GLYPHS = pdfmetrics.getFont("PatSans").face.charToGlyph
+                return "PatSans", True
+            except Exception:
+                pass
+    return "Helvetica", False
+
+
+def _pdf_inline(text, unicode_ok):
+    """Markdown inline subset -> reportlab Paragraph markup."""
+    # protect backslash escapes (\*, \_, \), ...) so they aren't treated as markup
+    text = re.sub(r"\\([\\*_`\[\]()#>+\-.!|])", lambda m: chr(_PRIV + ord(m.group(1))), text)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r"`([^`]+)`", r'<font face="Courier">\1</font>', text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
+                  lambda m: f'<link href="{m.group(2).replace(chr(34), "")}" color="#1a5fb4">{m.group(1)}</link>',
+                  text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(f"[{chr(_PRIV)}-{chr(_PRIV + 127)}]", lambda m: chr(ord(m.group(0)) - _PRIV), text)
+    if unicode_ok and _GLYPHS is not None:   # swap symbols the font can't draw (e.g. emoji)
+        text = "".join(c if ord(c) < 128 or ord(c) in _GLYPHS else "*" for c in text)
+    if not unicode_ok:   # built-in fonts only cover Latin-1/cp1252
+        text = re.sub(r"[\u2606\u2605\u2B51\u2728]", "*", text)
+        text = text.encode("cp1252", errors="replace").decode("cp1252")
+    return text
+
+
+def _pdf_image(path, max_w, max_h):
+    """reportlab Image scaled to fit; re-encodes via Pillow so WebP etc. work."""
+    import io
+    from PIL import Image as PILImage
+    from reportlab.platypus import Image
+    with PILImage.open(path) as im:
+        im.load()
+        w, h = im.size
+        buf = io.BytesIO()
+        if im.mode in ("RGBA", "LA", "P"):
+            im.convert("RGBA").save(buf, "PNG")
+        else:
+            im.convert("RGB").save(buf, "JPEG", quality=88)
+    buf.seek(0)
+    scale = min(max_w / w, max_h / h, 1.0)
+    return Image(buf, width=w * scale, height=h * scale)
+
+
+def write_pdf(md_text, base_dir, pdf_path):
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
+                                    TableStyle)
+
+    family, uni = _register_fonts()
+    bold = {"PatSans": "PatSans-B"}.get(family, "Helvetica-Bold")
+    base = ParagraphStyle("base", fontName=family, fontSize=10, leading=14, alignment=TA_LEFT)
+    st = {
+        "p": base,
+        "title": ParagraphStyle("title", parent=base, fontName=bold, fontSize=22, leading=27, spaceAfter=4),
+        "h2": ParagraphStyle("h2", parent=base, fontName=bold, fontSize=15, leading=19,
+                             spaceBefore=14, spaceAfter=6, keepWithNext=1),
+        "h3": ParagraphStyle("h3", parent=base, fontName=bold, fontSize=12.5, leading=16,
+                             spaceBefore=10, spaceAfter=4, keepWithNext=1),
+        "h4": ParagraphStyle("h4", parent=base, fontName=bold, fontSize=11, leading=14,
+                             spaceBefore=8, spaceAfter=3, keepWithNext=1, textColor=colors.HexColor("#444444")),
+        "li": ParagraphStyle("li", parent=base, leftIndent=16, bulletIndent=4, spaceAfter=2),
+    }
+    margin = 0.8 * inch
+    page_w, page_h = letter
+    frame_w = page_w - 2 * margin
+
+    story, para, bullet = [], [], None
+
+    def flush_para():
+        nonlocal para
+        if para:
+            story.append(Paragraph("".join(para), st["p"]))
+            story.append(Spacer(1, 4))
+        para = []
+
+    def flush_bullet():
+        nonlocal bullet
+        if bullet is not None:
+            story.append(Paragraph(bullet, st["li"], bulletText="\u2022" if uni else "-"))
+        bullet = None
+
+    def fmt(line):
+        """one markdown line -> markup, honouring the trailing two-space hard break"""
+        hard = line.endswith("  ")
+        return _pdf_inline(line.strip(), uni) + ("<br/>" if hard else " ")
+
+    lines = md_text.split("\n")
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        i += 1
+        if not ln.strip():
+            flush_para(); flush_bullet(); continue
+
+        m = re.match(r"^(#{1,4}) (.*)", ln)
+        if m:
+            flush_para(); flush_bullet()
+            story.append(Paragraph(_pdf_inline(m.group(2), uni), st[("title", "h2", "h3", "h4")[len(m.group(1)) - 1]]))
+            continue
+
+        m = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$", ln)
+        if m:
+            flush_para(); flush_bullet()
+            img_path = base_dir / m.group(2)
+            if img_path.exists():
+                try:
+                    story.append(_pdf_image(img_path, frame_w, 3.4 * inch))
+                    story.append(Spacer(1, 6))
+                except Exception as e:
+                    print(f"     [warn] PDF: couldn't place {m.group(2)}: {e}", file=sys.stderr)
+            continue
+
+        if ln.startswith("|"):
+            flush_para(); flush_bullet()
+            rows = []
+            i -= 1
+            while i < len(lines) and lines[i].startswith("|"):
+                if not re.match(r"^\|\s*-+", lines[i]):
+                    cells = [c.strip() for c in re.split(r"(?<!\\)\|", lines[i].strip().strip("|"))]
+                    rows.append(cells)
+                i += 1
+            if rows:
+                data = [[Paragraph(("<b>%s</b>" if r == 0 else "%s") % _pdf_inline(c, uni), base)
+                         for c in row] for r, row in enumerate(rows)]
+                t = Table(data, colWidths=[1.3 * inch, frame_w - 1.3 * inch], repeatRows=1)
+                t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bbbbbb")),
+                                       ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eeeeee")),
+                                       ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+                story.append(t)
+                story.append(Spacer(1, 6))
+            continue
+
+        m = re.match(r"^- (.*)", ln)
+        if m:
+            flush_para(); flush_bullet()
+            bullet = fmt(m.group(1))
+            continue
+
+        if bullet is not None and ln.startswith("  "):   # continuation of a list item
+            bullet += fmt(ln)
+            continue
+
+        flush_bullet()
+        para.append(fmt(ln))     # plain paragraph line
+    flush_para(); flush_bullet()
+
+    title = next((l[2:] for l in lines if l.startswith("# ")), "pattern")
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(family, 8)
+        canvas.setFillColor(colors.HexColor("#777777"))
+        canvas.drawCentredString(page_w / 2, 0.45 * inch, f"{doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=0.8 * inch,
+                            title=re.sub(r"\\(.)", r"\1", title))
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return pdf_path
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Convert ONE crochet pattern page saved with SingleFile into Markdown.")
@@ -526,6 +736,8 @@ def main(argv=None):
                          "<page>.photos.json next to the HTML file, if it exists)")
     ap.add_argument("--no-photos", action="store_true",
                     help="ignore any <page>.photos.json")
+    ap.add_argument("--pdf", action="store_true",
+                    help="also write a PDF next to the Markdown file (needs: pip install reportlab)")
     ap.add_argument("--no-photo-markers", action="store_true",
                     help="don't insert a text note where a (non-saved) step photo/video existed")
     args = ap.parse_args(argv)
@@ -562,6 +774,17 @@ def main(argv=None):
     if s["mismatch"]:
         print(f"     note: {s['mismatch']} collapsed row(s) differed from their "
               f"expansions; the expansions were listed under them")
+    if args.pdf:
+        try:
+            pdf_path = write_pdf(out_path.read_text(encoding="utf-8"), args.out,
+                                 out_path.with_suffix(".pdf"))
+        except ImportError:
+            print("[FAIL] --pdf needs reportlab:  pip install reportlab", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"[FAIL] couldn't write the PDF: {e}", file=sys.stderr)
+            return 1
+        print(f"[ok] {pdf_path}")
     return 0
 
 

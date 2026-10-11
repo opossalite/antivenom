@@ -3,7 +3,7 @@ Fiber art pattern generator.
 
 ## Use
 
-1. Python dependencies: `beautifulsoup4 lxml`
+1. Python dependencies: `beautifulsoup4 lxml reportlab`
 1. Run the following script for images (press F12, console tab), this will download a .json file:
 ```
 (async () => {
