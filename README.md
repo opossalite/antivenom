@@ -35,9 +35,10 @@ Fiber art pattern generator.
 2. Run SingleFile.
 3. Put the .html and the .json in the same location, then run this:
 ```
-python antivenom.py "file.html" --photos "file.json" -o patterns/
+python antivenom.py "file.html" --photos "file.json" --pdf -o patterns/
 ```
 4. Optional: use `--no-photos --no-photo-markers` if not using photos and only care about text
+5. Optional: can remove the `--pdf` flag if a .pdf is not needed
 
 ## License
 This work is dual-licensed under GPL Version 2 and GPL Version 3. You may choose between these licenses on a case-by-case basis.
