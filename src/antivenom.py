@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-pat2md.py - turn crochet pattern web pages (saved with the SingleFile browser
-extension) into plain-text Markdown files + a folder of extracted images.
+antivenom.py - turn crochet pattern web pages (saved with the SingleFile browser
+extension) into plain-text Markdown files + a folder of extracted images, and
+optionally a nicely laid-out PDF.
 
 Usage
 -----
     pip install beautifulsoup4 lxml          # core
     pip install reportlab                    # only needed for --pdf
-    python pat2md.py "Vulpes the fox.html" -o patterns/
-    python pat2md.py "Vulpes the fox.html" -o patterns/ --photos "Vulpes the fox.json"
-    python pat2md.py "Vulpes the fox.html" -o patterns/ --pdf     # also writes vulpes-the-fox.pdf
+    python antivenom.py "Vulpes the fox.html" -o patterns/
+    python antivenom.py "Vulpes the fox.html" -o patterns/ --photos "Vulpes the fox.json"
+    python antivenom.py "Vulpes the fox.html" -o patterns/ --pdf     # also writes vulpes-the-fox.pdf
 
 One page per run. Output layout:
 
     patterns/
         vulpes-the-fox.md
+        vulpes-the-fox.pdf          (with --pdf)
         images/
             vulpes-the-fox/cover-01.jpg
             vulpes-the-fox/measurements-01.jpg
@@ -24,6 +26,11 @@ One page per run. Output layout:
 The Markdown never contains base64 data: images are written to disk and
 referenced as ![alt](images/<pattern>/<file>) at the spot where they appeared.
 
+The PDF only shows what the saved page actually contains: a cover page, an
+"at a glance" box (level / size / gauge ...), materials, abbreviations and the
+instructions as tables with the photos in place. Nothing is derived or invented -
+if the page has no materials list or difficulty, the PDF simply has none.
+
 What is (and isn't) in the saved HTML
 -------------------------------------
 Embedded in the file, so extracted:  cover photos, measurement photos, and any
@@ -31,8 +38,9 @@ step photo that was expanded on the page when you saved it.
 NOT in the file: the per-step photos behind the little camera icons. Those are
 fetched from the site's server only when you click the icon, so the saved page
 never contains them. Where one existed, the Markdown gets a short text marker
-(--no-photo-markers leaves those out). To get the photos, collect their URLs
-with the browser-console snippet and pass the resulting JSON with --photos.
+(--no-photo-markers leaves those out; the PDF never shows them). To get the
+photos, collect their URLs with the browser-console snippet and pass the
+resulting JSON with --photos.
 
 Photos JSON format
 ------------------
@@ -259,24 +267,22 @@ def cover_info(cover):
 
 
 def materials(container):
-    """-> list of (category or None, [item markdown lines])"""
+    """-> list of {"cat": str|None, "items": [{name, weight, text, hex, link}]}"""
     ul = container.select_one("ul.mat-table")
     if not ul:
         return []
     groups, current = [], None
     for ch in ul.find_all(recursive=False):
         if ch.name == "span" and ch.find("h2"):
-            current = (plain(ch.find("h2")), [])
+            current = {"cat": plain(ch.find("h2")), "items": []}
             groups.append(current)
         elif ch.name == "li" and "mat-line" in (ch.get("class") or []):
             if current is None:
-                current = (None, [])
+                current = {"cat": None, "items": []}
                 groups.append(current)
-            name = plain(ch.select_one(".colorpicker-name"))
             swatch = ch.select_one(".colorpicker-swatch")
             m = re.search(r"#[0-9a-fA-F]{3,8}", (swatch.get("style") or "") if swatch else "")
             item = ch.select_one(".mat_item")
-            weight = plain(item.select_one(".mat_weight")) if item else ""
             text = ""
             if item:
                 clone = BeautifulSoup(str(item), PARSER)
@@ -284,18 +290,14 @@ def materials(container):
                     w.decompose()
                 text = tidy(inline(clone))
             link = item.select_one("[data-full_link]") if item else None
-            line = "- "
-            if name:
-                line += f"**{esc(name)}**: "
-            if weight:
-                line += f"({esc(weight)}) "
-            line += text
-            if m:
-                line += f" - colour `{m.group(0)}`"
-            if link and link.get("data-full_link"):
-                line += f" ([link]({link['data-full_link']}))"
-            current[1].append(line.rstrip())
-    return [g for g in groups if g[1]]
+            current["items"].append({
+                "name": plain(ch.select_one(".colorpicker-name")),
+                "weight": plain(item.select_one(".mat_weight")) if item else "",
+                "text": text,
+                "hex": m.group(0) if m else "",
+                "link": (link.get("data-full_link") if link else "") or "",
+            })
+    return [g for g in groups if g["items"]]
 
 
 def abbreviations(container):
@@ -315,10 +317,15 @@ def has_icon(row_li, alt):
 
 
 def instructions(ul, images, markers=True, photo_urls=None):
-    """Walk <ul id=ul_main> in document order and emit Markdown blocks.
-    Returns (lines, stats)."""
+    """Walk <ul id=ul_main> in document order.
+    Returns (items, stats); every item is a dict with a "t" (type):
+      section / sub / text      -> {"text"}
+      round                     -> {"label", "text", "symbol"}   (symbol: note bullet)
+      expanded                  -> {"label", "text"}             (unrolled copy that differs)
+      image                     -> {"rel"}
+      marker                    -> {"kind": photo|video, "indent"}"""
     photo_urls = photo_urls or {}
-    out = []                       # list of (kind, text)
+    items = []
     stats = {"rows": 0, "photos_saved": 0, "photo_markers": 0, "mismatch": 0}
 
     # lines whose photo is embedded (expanded on the page when it was saved)
@@ -332,9 +339,9 @@ def instructions(ul, images, markers=True, photo_urls=None):
         label = plain(t2)
         stats["rows"] += 1
         if cls == "SectionRow":
-            out.append(("h", f"### {text}"))
+            items.append({"t": "section", "text": text})
         elif cls == "SubSectionRow":
-            out.append(("h", f"#### {text}"))
+            items.append({"t": "sub", "text": text})
         elif cls == "RndRow":
             if re.search(r"[0-9A-Za-z]", label):
                 # drop a leading "3)" / "4)-5)" if it just repeats the label
@@ -343,11 +350,11 @@ def instructions(ul, images, markers=True, photo_urls=None):
                 if m and n and m.group(1) == n.group(0):
                     text = text[m.end():]
                 lab = label.replace("-", "\u2013") if re.fullmatch(r"\d+-\d+", label) else label
-                out.append(("r", f"- **{esc(lab)}:** " + text.replace("\n", "\n  ")))
+                items.append({"t": "round", "label": lab, "text": text, "symbol": False})
             else:  # symbol-style note marker such as a star
-                out.append(("r", f"- {label} {text}".rstrip()))
+                items.append({"t": "round", "label": label, "text": text, "symbol": True})
         else:  # TextRow
-            out.append(("t", text))
+            items.append({"t": "text", "text": text})
 
         rid = (li.get("id") or "")
         line_no = rid[2:] if rid.startswith("li") else None
@@ -355,19 +362,18 @@ def instructions(ul, images, markers=True, photo_urls=None):
         if line_no in photo_urls and line_no not in embedded_after:
             rel = images.download(photo_urls[line_no])
             if rel:
-                out.append(("i", f"![step photo]({rel})"))
+                items.append({"t": "image", "rel": rel})
                 stats["photos_saved"] += 1
                 fetched = True
         if not markers:
             return
-        indent = "  " if out[-1][0] == "r" else ""
-        kind = "m" if indent else "p"
+        indent = items[-1]["t"] == "round"
         if has_icon(li, "Click to see video"):
-            out.append((kind, indent + VIDEO_MARKER))
+            items.append({"t": "marker", "kind": "video", "indent": indent})
             stats["photo_markers"] += 1
         if (not fetched and line_no not in embedded_after
                 and has_icon(li, "Click to see photo")):
-            out.append((kind, indent + PHOTO_MARKER))
+            items.append({"t": "marker", "kind": "photo", "indent": indent})
             stats["photo_markers"] += 1
 
     for ch in ul.find_all(recursive=False):
@@ -375,7 +381,7 @@ def instructions(ul, images, markers=True, photo_urls=None):
             img = ch.find("img")
             rel = images.save(img, "step") if img else None
             if rel:
-                out.append(("i", f"![step photo]({rel})"))
+                items.append({"t": "image", "rel": rel})
                 stats["photos_saved"] += 1
             continue
         if ch.name == "li":
@@ -394,21 +400,101 @@ def instructions(ul, images, markers=True, photo_urls=None):
                     t3 = inner.select_one("td.t3")
                     if t3 and plain(t3) != base:
                         stats["mismatch"] += 1
-                        out.append(("w", f"  - *(expanded row {plain(inner.select_one('td.t2'))}):* {inline_clean(t3)}"))
-
-    # join with sensible blank lines (consecutive list rows stay tight)
-    lines, prev = [], None
-    for kind, text in out:
-        if prev is not None:
-            tight = (prev in ("r", "m", "w") and kind in ("r", "m", "w"))
-            lines.append("" if not tight else None)
-        lines.append(text)
-        prev = kind
-    return [ln for ln in lines if ln is not None], stats
+                        items.append({"t": "expanded", "label": plain(inner.select_one("td.t2")),
+                                      "text": inline_clean(t3)})
+    return items, stats
 
 
 # --------------------------------------------------------------------------
-# one pattern file -> markdown
+# Markdown rendering
+# --------------------------------------------------------------------------
+def items_to_md(items):
+    """Instruction items -> Markdown lines (consecutive list rows stay tight)."""
+    pieces = []   # (kind, text)
+    for it in items:
+        t = it["t"]
+        if t == "section":
+            pieces.append(("h", f"### {it['text']}"))
+        elif t == "sub":
+            pieces.append(("h", f"#### {it['text']}"))
+        elif t == "text":
+            pieces.append(("t", it["text"]))
+        elif t == "round":
+            if it["symbol"]:
+                pieces.append(("r", f"- {it['label']} {it['text']}".rstrip()))
+            else:
+                pieces.append(("r", f"- **{esc(it['label'])}:** " + it["text"].replace("\n", "\n  ")))
+        elif t == "image":
+            pieces.append(("i", f"![step photo]({it['rel']})"))
+        elif t == "marker":
+            text = PHOTO_MARKER if it["kind"] == "photo" else VIDEO_MARKER
+            pieces.append(("m", "  " + text) if it["indent"] else ("p", text))
+        elif t == "expanded":
+            pieces.append(("w", f"  - *(expanded row {it['label']}):* {it['text']}"))
+    lines, prev = [], None
+    for kind, text in pieces:
+        if prev is not None and not (prev in ("r", "m", "w") and kind in ("r", "m", "w")):
+            lines.append("")
+        lines.append(text)
+        prev = kind
+    return lines
+
+
+def render_md(d):
+    title = d["title"]
+    md = [f"# {esc(title)}", ""]
+    if d["designer"]:
+        md += [f"*{esc(d['designer'])}*", ""]
+    for i, rel in enumerate(d["cover_imgs"], 1):
+        md += [f"![{esc(title)} - cover photo {i}]({rel})", ""]
+    if d["info"]:
+        md += [f"- **{esc(k)}:** {esc(v)}" for k, v in d["info"]]
+        md.append("")
+    if d["tags"]:
+        md += ["Tags: " + " ".join(esc(t) for t in d["tags"]), ""]
+    if d["about"]:
+        md += ["## About this pattern", ""]
+        for b in d["about"]:
+            md += [b, ""]
+    if d["measure"]:
+        md += ["## Measurements", ""]
+        for b in d["measure"]["paras"]:
+            md += [b, ""]
+        for i, rel in enumerate(d["measure"]["imgs"], 1):
+            md += [f"![measurements photo {i}]({rel})", ""]
+    if d["materials"]:
+        md += ["## Materials", ""]
+        for g in d["materials"]:
+            if g["cat"]:
+                md += [f"### {esc(g['cat'])}", ""]
+            for it in g["items"]:
+                line = "- "
+                if it["name"]:
+                    line += f"**{esc(it['name'])}**: "
+                if it["weight"]:
+                    line += f"({esc(it['weight'])}) "
+                line += it["text"]
+                if it["hex"]:
+                    line += f" - colour `{it['hex']}`"
+                if it["link"]:
+                    line += f" ([link]({it['link']}))"
+                md.append(line.rstrip())
+            md.append("")
+    if d["items"] is not None:
+        md += ["## Instructions", ""]
+        md += items_to_md(d["items"]) + [""]
+    if d["abbr"]:
+        md += ["## Abbreviations", "", "| Abbreviation | Meaning |", "| --- | --- |"]
+
+        def cell(s):
+            return esc(s).replace("|", "\\|")
+        md += [f"| {cell(a)} | {cell(b)} |" for a, b in d["abbr"]]
+        md.append("")
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(md)).rstrip() + "\n"
+
+
+# --------------------------------------------------------------------------
+# one pattern file -> data model -> markdown (+ optional pdf)
 # --------------------------------------------------------------------------
 def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, referer=None):
     raw = path.read_text(encoding="utf-8", errors="replace")
@@ -431,39 +517,21 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
               f"'{title}' - double-check you paired the right files", file=sys.stderr)
 
     cover = page.select_one(".wrapper-cover")
-    designer = plain(page.select_one("#designer-cover"))
+    d = {"title": title, "designer": plain(page.select_one("#designer-cover")),
+         "cover_imgs": [], "info": [], "tags": [], "about": [], "measure": None,
+         "materials": [], "abbr": [], "items": None}
 
-    md = [f"# {esc(title)}", ""]
-    if designer:
-        md += [f"*{esc(designer)}*", ""]
-
-    # ---- cover photos
-    cover_imgs = []
     for img in cover.select(".pattern_image_cover img"):
         rel = images.save(img, "cover")
-        if rel and rel not in cover_imgs:
-            cover_imgs.append(rel)
-    for i, rel in enumerate(cover_imgs, 1):
-        md += [f"![{esc(title)} - cover photo {i}]({rel})", ""]
+        if rel and rel not in d["cover_imgs"]:
+            d["cover_imgs"].append(rel)
+    d["info"], d["tags"] = cover_info(cover)
 
-    # ---- quick facts
-    info, tags = cover_info(cover)
-    if info:
-        md += [f"- **{esc(k)}:** {esc(v)}" for k, v in info]
-        md.append("")
-    if tags:
-        md += ["Tags: " + " ".join(esc(t) for t in tags), ""]
-
-    # ---- about
     about = page.select_one(".abbr-container .abbr-intro")
     if about and plain(about):
-        md += ["## About this pattern", ""]
-        for b in blocks(about):
-            md += [b, ""]
+        d["about"] = blocks(about)
 
-    # ---- measurements
     meas = page.select_one(".measure_text")
-    abbr_rows = []
     if meas:
         intro = meas.select_one(".abbr-intro")
         meas_imgs = []
@@ -472,55 +540,39 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
             if rel and rel not in meas_imgs:
                 meas_imgs.append(rel)
         if (intro and plain(intro)) or meas_imgs:
-            md += ["## Measurements", ""]
-            if intro:
-                for b in blocks(intro):
-                    md += [b, ""]
-            for i, rel in enumerate(meas_imgs, 1):
-                md += [f"![measurements photo {i}]({rel})", ""]
-        abbr_rows = abbreviations(meas)
+            d["measure"] = {"paras": blocks(intro) if intro else [], "imgs": meas_imgs}
+        d["abbr"] = abbreviations(meas)
 
-    # ---- materials
     mat = page.select_one(".materials_page_container")
     if mat:
-        groups = materials(mat)
-        if groups:
-            md += ["## Materials", ""]
-            for cat, items in groups:
-                if cat:
-                    md += [f"### {esc(cat)}", ""]
-                md += items + [""]
+        d["materials"] = materials(mat)
 
-    # ---- instructions
     ul = page.find(id="ul_main")
     stats = {"rows": 0, "photos_saved": 0, "photo_markers": 0, "mismatch": 0}
     if ul:
-        md += ["## Instructions", ""]
-        body, stats = instructions(ul, images, markers, photo_urls)
-        md += body + [""]
+        d["items"], stats = instructions(ul, images, markers, photo_urls)
 
-    # ---- abbreviations
-    if abbr_rows:
-        md += ["## Abbreviations", "", "| Abbreviation | Meaning |", "| --- | --- |"]
-
-        def cell(s):
-            return esc(s).replace("|", "\\|")
-        md += [f"| {cell(a)} | {cell(b)} |" for a, b in abbr_rows]
-        md.append("")
-
-    text = "\n".join(md)
-    text = re.sub(r"\n{3,}", "\n\n", text).rstrip() + "\n"
     out_path = out_dir / f"{slug}.md"
-    out_path.write_text(text, encoding="utf-8")
-
+    out_path.write_text(render_md(d), encoding="utf-8")
     stats["images"] = len(images.seen)
-    return out_path, stats
+    return out_path, stats, d
 
 
 # --------------------------------------------------------------------------
-# PDF output (--pdf): rendered from the Markdown this script just wrote
+# PDF output (--pdf)
 # --------------------------------------------------------------------------
-_FONT_CANDIDATES = [   # (regular, bold, italic, bold-italic) - first set that exists wins
+# (regular path, bold file, italic file, bold-italic file) - first set that exists wins
+_FONT_CANDIDATES = [
+    ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf",
+     "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"),
+    ("/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf",
+     "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"),
+    ("/usr/share/fonts/liberation/LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf",
+     "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"),
+    ("C:/Windows/Fonts/arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"),
+    ("/Library/Fonts/Arial.ttf", "Arial Bold.ttf", "Arial Italic.ttf", "Arial Bold Italic.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "Arial Bold.ttf", "Arial Italic.ttf",
+     "Arial Bold Italic.ttf"),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
      "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
     ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
@@ -529,43 +581,39 @@ _FONT_CANDIDATES = [   # (regular, bold, italic, bold-italic) - first set that e
      "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
     ("/usr/share/fonts/TTF/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
      "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
-    ("/Library/Fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
-     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
-    ("C:/Windows/Fonts/DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
-     "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
 ]
 _PRIV = 0xE000   # private-use range used to protect backslash-escaped characters
 _GLYPHS = None   # set by _register_fonts(): characters the chosen font can draw
 
 
 def _register_fonts():
-    """Use DejaVu Sans if installed (covers symbols like the star bullets);
-    otherwise fall back to built-in Helvetica. Returns (family, unicode_ok)."""
+    """Prefer Liberation Sans / Arial, then DejaVu Sans; else built-in Helvetica.
+    Returns (regular, bold, unicode_ok)."""
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+    global _GLYPHS
     for reg, b, i, bi in _FONT_CANDIDATES:
         reg = Path(reg)
         if reg.exists():
-            d = reg.parent
             try:
-                pdfmetrics.registerFont(TTFont("PatSans", str(reg)))
-                names = {"normal": "PatSans"}
-                for key, fn, nm in (("bold", b, "PatSans-B"), ("italic", i, "PatSans-I"),
-                                    ("boldItalic", bi, "PatSans-BI")):
-                    f = d / fn
+                pdfmetrics.registerFont(TTFont("AvSans", str(reg)))
+                names = {"normal": "AvSans"}
+                for key, fn, nm in (("bold", b, "AvSans-B"), ("italic", i, "AvSans-I"),
+                                    ("boldItalic", bi, "AvSans-BI")):
+                    f = reg.parent / fn
                     pdfmetrics.registerFont(TTFont(nm, str(f if f.exists() else reg)))
                     names[key] = nm
-                pdfmetrics.registerFontFamily("PatSans", **names)
-                global _GLYPHS
-                _GLYPHS = pdfmetrics.getFont("PatSans").face.charToGlyph
-                return "PatSans", True
+                pdfmetrics.registerFontFamily("AvSans", **names)
+                _GLYPHS = pdfmetrics.getFont("AvSans").face.charToGlyph
+                return "AvSans", "AvSans-B", True
             except Exception:
                 pass
-    return "Helvetica", False
+    _GLYPHS = None
+    return "Helvetica", "Helvetica-Bold", False
 
 
 def _pdf_inline(text, unicode_ok):
-    """Markdown inline subset -> reportlab Paragraph markup."""
+    """Markdown inline subset -> reportlab Paragraph markup ('  \\n' = line break)."""
     # protect backslash escapes (\*, \_, \), ...) so they aren't treated as markup
     text = re.sub(r"\\([\\*_`\[\]()#>+\-.!|])", lambda m: chr(_PRIV + ord(m.group(1))), text)
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -576,6 +624,8 @@ def _pdf_inline(text, unicode_ok):
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
     text = re.sub(f"[{chr(_PRIV)}-{chr(_PRIV + 127)}]", lambda m: chr(ord(m.group(0)) - _PRIV), text)
+    text = text.replace("  \n", "<br/>").replace("\n", " ")
+    text = re.sub(r"^(\s*<br/>)+|(<br/>\s*)+$", "", text)     # no dangling line breaks
     if unicode_ok and _GLYPHS is not None:   # swap symbols the font can't draw (e.g. emoji)
         text = "".join(c if ord(c) < 128 or ord(c) in _GLYPHS else "*" for c in text)
     if not unicode_ok:   # built-in fonts only cover Latin-1/cp1252
@@ -584,11 +634,14 @@ def _pdf_inline(text, unicode_ok):
     return text
 
 
-def _pdf_image(path, max_w, max_h):
-    """reportlab Image scaled to fit; re-encodes via Pillow so WebP etc. work."""
+def _xml(s, unicode_ok=True):
+    return _pdf_inline(esc(s), unicode_ok)
+
+
+def _load_image(path):
+    """PIL image as RGB(A) -> (BytesIO, w, h). Re-encodes so WebP etc. work."""
     import io
     from PIL import Image as PILImage
-    from reportlab.platypus import Image
     with PILImage.open(path) as im:
         im.load()
         w, h = im.size
@@ -598,136 +651,350 @@ def _pdf_image(path, max_w, max_h):
         else:
             im.convert("RGB").save(buf, "JPEG", quality=88)
     buf.seek(0)
+    return buf, w, h
+
+
+def _fit_image(path, max_w, max_h):
+    from reportlab.platypus import Image
+    buf, w, h = _load_image(path)
     scale = min(max_w / w, max_h / h, 1.0)
     return Image(buf, width=w * scale, height=h * scale)
 
 
-def write_pdf(md_text, base_dir, pdf_path):
+def _palette(path):
+    """Pick an accent hue from the pattern's cover photo (falls back to teal)."""
+    import colorsys
+    hue = 0.48
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((96, 96))
+            raw = im.tobytes()
+            px = [tuple(raw[i:i + 3]) for i in range(0, len(raw), 3)]
+        weights = [0.0] * 12
+        for r, g, b in px:
+            h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            if s > 0.3 and 0.25 < v < 0.95:
+                weights[int(h * 12) % 12] += s * v
+        if sum(weights) > 5:
+            hue = (max(range(12), key=weights.__getitem__) + 0.5) / 12
+    except Exception:
+        pass
+    from reportlab.lib.colors import Color
+    mk = lambda s, v: Color(*colorsys.hsv_to_rgb(hue, s, v))
+    return {"dark": mk(0.72, 0.36), "mid": mk(0.62, 0.58), "tint": mk(0.14, 0.97),
+            "tint2": mk(0.06, 0.985), "bg": mk(0.30, 0.92), "dots": mk(0.16, 0.97)}
+
+
+def render_pdf(d, base_dir, pdf_path):
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
-                                    TableStyle)
+    from reportlab.lib.utils import ImageReader, simpleSplit
+    from reportlab.platypus import (CondPageBreak, HRFlowable, PageBreak, Paragraph,
+                                    SimpleDocTemplate, Spacer, Table, TableStyle)
 
-    family, uni = _register_fonts()
-    bold = {"PatSans": "PatSans-B"}.get(family, "Helvetica-Bold")
-    base = ParagraphStyle("base", fontName=family, fontSize=10, leading=14, alignment=TA_LEFT)
-    st = {
-        "p": base,
-        "title": ParagraphStyle("title", parent=base, fontName=bold, fontSize=22, leading=27, spaceAfter=4),
-        "h2": ParagraphStyle("h2", parent=base, fontName=bold, fontSize=15, leading=19,
-                             spaceBefore=14, spaceAfter=6, keepWithNext=1),
-        "h3": ParagraphStyle("h3", parent=base, fontName=bold, fontSize=12.5, leading=16,
-                             spaceBefore=10, spaceAfter=4, keepWithNext=1),
-        "h4": ParagraphStyle("h4", parent=base, fontName=bold, fontSize=11, leading=14,
-                             spaceBefore=8, spaceAfter=3, keepWithNext=1, textColor=colors.HexColor("#444444")),
-        "li": ParagraphStyle("li", parent=base, leftIndent=16, bulletIndent=4, spaceAfter=2),
-    }
-    margin = 0.8 * inch
+    reg, bold, uni = _register_fonts()
+    italic = {"AvSans-B": "AvSans-I"}.get(bold, "Helvetica-Oblique")
+    px = lambda s: _pdf_inline(s, uni)               # markdown-inline -> markup
+    title = d["title"]
+    cover_paths = [base_dir / r for r in d["cover_imgs"] if (base_dir / r).exists()]
+    pal = _palette(cover_paths[0]) if cover_paths else _palette(None)
+
     page_w, page_h = letter
-    frame_w = page_w - 2 * margin
+    margin = 0.8 * inch
+    fw = page_w - 2 * margin
+    GREY = colors.HexColor("#777777")
 
-    story, para, bullet = [], [], None
+    body = ParagraphStyle("body", fontName=reg, fontSize=10, leading=14.5)
+    S = {
+        "body": body,
+        "cell": ParagraphStyle("cell", parent=body, leading=14),
+        "label": ParagraphStyle("label", parent=body, fontName=bold, textColor=pal["dark"]),
+        "h1": ParagraphStyle("h1", parent=body, fontName=bold, fontSize=19, leading=23,
+                             textColor=pal["dark"], spaceBefore=12, spaceAfter=2, keepWithNext=1),
+        "band": ParagraphStyle("band", parent=body, fontName=bold, fontSize=13, leading=17,
+                               textColor=colors.white),
+        "sub": ParagraphStyle("sub", parent=body, fontName=bold, fontSize=11.5, leading=15,
+                              textColor=pal["dark"], spaceBefore=8, spaceAfter=1, keepWithNext=1),
+        "cat": ParagraphStyle("cat", parent=body, fontName=bold, fontSize=9, leading=12,
+                              textColor=GREY, spaceBefore=6, spaceAfter=2, keepWithNext=1),
+        "small": ParagraphStyle("small", parent=body, fontSize=8.5, leading=11.5, textColor=GREY),
+        "note": ParagraphStyle("note", parent=body, fontName=italic),
+    }
 
-    def flush_para():
-        nonlocal para
-        if para:
-            story.append(Paragraph("".join(para), st["p"]))
-            story.append(Spacer(1, 4))
-        para = []
+    def P(text, style="body"):
+        return Paragraph(px(text), S[style])
 
-    def flush_bullet():
-        nonlocal bullet
-        if bullet is not None:
-            story.append(Paragraph(bullet, st["li"], bulletText="\u2022" if uni else "-"))
-        bullet = None
+    story = [PageBreak()]          # page 1 is the cover, drawn on the canvas
 
-    def fmt(line):
-        """one markdown line -> markup, honouring the trailing two-space hard break"""
-        hard = line.endswith("  ")
-        return _pdf_inline(line.strip(), uni) + ("<br/>" if hard else " ")
+    def rule(thickness, color, after):
+        r = HRFlowable(width="100%", thickness=thickness, color=color, spaceBefore=1, spaceAfter=after)
+        r.keepWithNext = 1
+        return r
 
-    lines = md_text.split("\n")
+    def heading(text, level="h1"):
+        story.append(CondPageBreak(1.7 * inch))
+        story.append(Paragraph(_xml(text, uni), S[level]))
+        if level == "h1":
+            story.append(rule(1.6, pal["mid"], 7))
+
+    def box(rows_or_flowables, accent_bar=True):
+        t = Table([[f] for f in rows_or_flowables], colWidths=[fw])
+        style = [("BACKGROUND", (0, 0), (-1, -1), pal["tint"]),
+                 ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                 ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]
+        if accent_bar:
+            style.append(("LINEBEFORE", (0, 0), (0, -1), 4, pal["mid"]))
+        t.setStyle(TableStyle(style))
+        return t
+
+    def photo_grid(rels, max_h=2.9 * inch):
+        """Photos placed 2-up (a single photo is centred and a bit larger)."""
+        paths = [base_dir / r for r in rels if (base_dir / r).exists()]
+        if not paths:
+            return
+        n = len(paths)
+        per_row = 1 if n == 1 else (3 if n >= 5 else 2)
+        gap = 10
+        cell_w = (fw - gap * (per_row - 1)) / per_row
+        mh = {1: 3.2 * inch, 2: max_h, 3: 2.3 * inch}[per_row]
+        cells = []
+        for p in paths:
+            try:
+                cells.append(_fit_image(p, cell_w, mh))
+            except Exception as e:
+                print(f"     [warn] PDF: couldn't place {p.name}: {e}", file=sys.stderr)
+        for i in range(0, len(cells), per_row):
+            row = cells[i:i + per_row]
+            t = Table([row], colWidths=[cell_w] * len(row), hAlign="CENTER")   # short last row is centred
+            t.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                                   ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+            story.append(t)
+        story.append(Spacer(1, 4))
+
+    # ---- at a glance + extra cover photos ----
+    glance = []
+    for k, v in d["info"]:
+        glance.append(Table([[Paragraph(f"<b>{_xml(k, uni)}</b>", S["label"]), P(esc(v), "cell")]],
+                            colWidths=[0.95 * inch, fw - 0.95 * inch - 22],
+                            style=[("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                   ("TOPPADDING", (0, 0), (-1, -1), 1),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
+    if d["tags"]:
+        glance.append(Paragraph(" ".join(_xml(t, uni) for t in d["tags"]), S["small"]))
+    if glance:
+        heading("At a glance")
+        story += [box(glance), Spacer(1, 8)]
+    if len(d["cover_imgs"]) > 1:
+        photo_grid(d["cover_imgs"][1:])
+
+    # ---- about / measurements ----
+    if d["about"]:
+        heading("About this pattern")
+        for b in d["about"]:
+            story += [P(b), Spacer(1, 5)]
+    if d["measure"]:
+        heading("Measurements")
+        for b in d["measure"]["paras"]:
+            story += [P(b), Spacer(1, 4)]
+        photo_grid(d["measure"]["imgs"])
+
+    # ---- materials ----
+    if d["materials"]:
+        heading("Materials")
+        for g in d["materials"]:
+            if g["cat"]:
+                story.append(Paragraph(_xml(g["cat"].upper(), uni), S["cat"]))
+            has_sw = any(it["hex"] for it in g["items"])
+            spans = []
+            rows, styles = [], [("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
+                                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]
+            for r, it in enumerate(g["items"]):
+                name = f"<b>{_xml(it['name'], uni)}</b>" if it["name"] else ""
+                if it["weight"]:
+                    name += f" <font color='#777777'>{_xml(it['weight'], uni)}</font>"
+                text = "" if re.fullmatch(r"[.\u2026\s-]*", it["text"]) else px(it["text"])
+                if it["link"]:
+                    text += f" <link href='{it['link']}' color='#1a5fb4'>[link]</link>"
+                row = []
+                if has_sw:
+                    row.append("")
+                    if it["hex"]:
+                        try:
+                            styles.append(("BACKGROUND", (0, r), (0, r), colors.HexColor(it["hex"])))
+                            styles.append(("LINEBELOW", (0, r), (0, r), 3, colors.white))
+                        except Exception:
+                            pass
+                if name:
+                    row += [Paragraph(name, S["cell"]), Paragraph(text, S["cell"])]
+                else:                       # nothing to put in the name column: let the text span it
+                    spans.append(("SPAN", (len(row), r), (len(row) + 1, r)))
+                    row += [Paragraph(text, S["cell"]), ""]
+                rows.append(row)
+            widths = ([0.3 * inch] if has_sw else []) + [1.25 * inch]
+            widths.append(fw - sum(widths))
+            t = Table(rows, colWidths=widths)
+            t.setStyle(TableStyle(styles + spans))
+            story += [t, Spacer(1, 6)]
+
+    # ---- abbreviations (compact, before the instructions - like a printed pattern) ----
+    if d["abbr"]:
+        heading("Abbreviations")
+        pairs = [(Paragraph(f"<b>{_xml(a, uni)}</b>", S["label"]), Paragraph(_xml(b, uni), S["cell"]))
+                 for a, b in d["abbr"]]
+        rows = []
+        for i in range(0, len(pairs), 2):
+            chunk = pairs[i:i + 2]
+            row = [chunk[0][0], chunk[0][1]] + ([chunk[1][0], chunk[1][1]] if len(chunk) > 1 else ["", ""])
+            rows.append(row)
+        aw = 0.65 * inch
+        t = Table(rows, colWidths=[aw, fw / 2 - aw, aw, fw / 2 - aw])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
+                               ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        story += [t, Spacer(1, 6)]
+
+    # ---- instructions ----
+    items = d["items"] or []
+    if items:
+        story.append(CondPageBreak(3 * inch))
+        heading("Instructions")
+    round_rows = []
+
+    def flush_rounds():
+        if not round_rows:
+            return
+        t = Table(round_rows, colWidths=[0.8 * inch, fw - 0.8 * inch])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, pal["tint2"]]),
+                               ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#e2e2e2")),
+                               ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 6)]))
+        story.extend([t, Spacer(1, 7)])
+        round_rows.clear()
+
     i = 0
-    while i < len(lines):
-        ln = lines[i]
-        i += 1
-        if not ln.strip():
-            flush_para(); flush_bullet(); continue
-
-        m = re.match(r"^(#{1,4}) (.*)", ln)
-        if m:
-            flush_para(); flush_bullet()
-            story.append(Paragraph(_pdf_inline(m.group(2), uni), st[("title", "h2", "h3", "h4")[len(m.group(1)) - 1]]))
+    while i < len(items):
+        it = items[i]
+        t = it["t"]
+        if t in ("round", "expanded") and not it.get("symbol"):
+            label = it["label"] if t == "round" else "\u21b3"
+            round_rows.append([Paragraph(f"<b>{_xml(label, uni)}</b>", S["label"]), P(it["text"], "cell")])
+            i += 1
             continue
-
-        m = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$", ln)
-        if m:
-            flush_para(); flush_bullet()
-            img_path = base_dir / m.group(2)
-            if img_path.exists():
-                try:
-                    story.append(_pdf_image(img_path, frame_w, 3.4 * inch))
-                    story.append(Spacer(1, 6))
-                except Exception as e:
-                    print(f"     [warn] PDF: couldn't place {m.group(2)}: {e}", file=sys.stderr)
-            continue
-
-        if ln.startswith("|"):
-            flush_para(); flush_bullet()
-            rows = []
-            i -= 1
-            while i < len(lines) and lines[i].startswith("|"):
-                if not re.match(r"^\|\s*-+", lines[i]):
-                    cells = [c.strip() for c in re.split(r"(?<!\\)\|", lines[i].strip().strip("|"))]
-                    rows.append(cells)
+        flush_rounds()
+        if t == "section":
+            story.append(CondPageBreak(1.7 * inch))
+            band = Table([[Paragraph(px(it["text"]), S["band"])]], colWidths=[fw])
+            band.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), pal["dark"]),
+                                      ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                                      ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+            story += [Spacer(1, 8), band, Spacer(1, 6)]
+        elif t == "sub":
+            story.append(CondPageBreak(1.4 * inch))
+            story.append(Paragraph(px(it["text"]), S["sub"]))
+            story.append(rule(0.6, pal["mid"], 5))
+        elif t == "text":
+            story += [P(it["text"]), Spacer(1, 5)]
+        elif t == "round":      # note bullet (star etc.) -> callout
+            story += [box([P(it["text"], "note")]), Spacer(1, 6)]
+        elif t == "image":
+            rels = []
+            while i < len(items) and items[i]["t"] == "image":     # group neighbouring photos
+                rels.append(items[i]["rel"])
                 i += 1
-            if rows:
-                data = [[Paragraph(("<b>%s</b>" if r == 0 else "%s") % _pdf_inline(c, uni), base)
-                         for c in row] for r, row in enumerate(rows)]
-                t = Table(data, colWidths=[1.3 * inch, frame_w - 1.3 * inch], repeatRows=1)
-                t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bbbbbb")),
-                                       ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eeeeee")),
-                                       ("VALIGN", (0, 0), (-1, -1), "TOP")]))
-                story.append(t)
-                story.append(Spacer(1, 6))
+            photo_grid(rels)
             continue
+        # markers (missing photo / video notes) are not shown in the PDF
+        i += 1
+    flush_rounds()
 
-        m = re.match(r"^- (.*)", ln)
-        if m:
-            flush_para(); flush_bullet()
-            bullet = fmt(m.group(1))
-            continue
+    # ---- page furniture ----
+    def draw_cover(c):
+        c.setFillColor(pal["bg"])
+        c.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+        c.setFillColor(pal["dots"])
+        for yy in range(18, int(page_h), 44):
+            for xx in range(18, int(page_w), 44):
+                c.circle(xx, yy, 6, stroke=0, fill=1)
+        tx = _pdf_inline(esc(title), uni)
+        tx = re.sub(r"<[^>]+>", "", tx).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        size = 38
+        while size > 22:
+            lines = simpleSplit(tx, bold, size, page_w - 2 * margin)
+            if len(lines) <= 3:
+                break
+            size -= 3
+        y = page_h - 0.95 * inch
+        c.setFillColor(pal["dark"])
+        c.setFont(bold, size)
+        for ln in lines:
+            c.drawCentredString(page_w / 2, y, ln)
+            y -= size * 1.15
+        if d["designer"]:
+            y -= 2
+            c.setFont(reg, 14)
+            dsg = re.sub(r"<[^>]+>", "", _pdf_inline(esc(d["designer"]), uni)).replace("&amp;", "&")
+            c.drawCentredString(page_w / 2, y, dsg)
+            y -= 14
+        pill = [f"{k}: {v}" for k, v in d["info"] if re.search(r"level|size", k, re.I) and v][:2]
+        pill_h = (18 * len(pill) + 14) if pill else 0
+        frame_top = y - 18
+        frame_bottom = 0.9 * inch + (pill_h + 22 if pill else 0)
+        if cover_paths and frame_top - frame_bottom > 2 * inch:
+            fx, fwid, fh = 0.6 * inch, page_w - 1.2 * inch, frame_top - frame_bottom
+            c.setFillColor(colors.white)
+            c.setStrokeColor(pal["mid"])
+            c.setLineWidth(5)
+            c.roundRect(fx, frame_bottom, fwid, fh, 14, stroke=1, fill=1)
+            buf, w, h = _load_image(cover_paths[0])
+            pad = 14
+            sc = min((fwid - 2 * pad) / w, (fh - 2 * pad) / h)
+            iw, ih = w * sc, h * sc
+            c.drawImage(ImageReader(buf), fx + (fwid - iw) / 2, frame_bottom + (fh - ih) / 2, iw, ih)
+        if pill:
+            wtxt = max(c.stringWidth(p, bold, 12.5) for p in pill) + 28
+            c.setFillColor(pal["dark"])
+            c.roundRect(0.6 * inch, 0.9 * inch, wtxt, pill_h, 7, stroke=0, fill=1)
+            c.setFillColor(colors.white)
+            c.setFont(bold, 12.5)
+            for n, p in enumerate(pill):
+                c.drawString(0.6 * inch + 14, 0.9 * inch + pill_h - 22 - 18 * n, p)
 
-        if bullet is not None and ln.startswith("  "):   # continuation of a list item
-            bullet += fmt(ln)
-            continue
+    def on_first(c, doc):
+        c.saveState()
+        draw_cover(c)
+        c.restoreState()
 
-        flush_bullet()
-        para.append(fmt(ln))     # plain paragraph line
-    flush_para(); flush_bullet()
-
-    title = next((l[2:] for l in lines if l.startswith("# ")), "pattern")
-
-    def footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(family, 8)
-        canvas.setFillColor(colors.HexColor("#777777"))
-        canvas.drawCentredString(page_w / 2, 0.45 * inch, f"{doc.page}")
-        canvas.restoreState()
+    def on_later(c, doc):
+        c.saveState()
+        c.setStrokeColor(colors.HexColor("#dddddd"))
+        c.setLineWidth(0.5)
+        c.line(margin, 0.62 * inch, page_w - margin, 0.62 * inch)
+        c.setFont(reg, 8)
+        c.setFillColor(GREY)
+        tt = re.sub(r"<[^>]+>", "", _pdf_inline(esc(title), uni)).replace("&amp;", "&")
+        c.drawString(margin, 0.45 * inch, tt)
+        c.drawRightString(page_w - margin, 0.45 * inch, str(doc.page))
+        c.restoreState()
 
     doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, leftMargin=margin, rightMargin=margin,
-                            topMargin=margin, bottomMargin=0.8 * inch,
-                            title=re.sub(r"\\(.)", r"\1", title))
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+                            topMargin=0.75 * inch, bottomMargin=0.85 * inch, title=title,
+                            author=d["designer"] or "")
+    doc.build(story, onFirstPage=on_first, onLaterPages=on_later)
     return pdf_path
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Convert ONE crochet pattern page saved with SingleFile into Markdown.")
+        description="Convert ONE crochet pattern page saved with SingleFile into Markdown (and a PDF).")
     ap.add_argument("file", type=Path, help="the saved .html pattern page")
     ap.add_argument("-o", "--out", type=Path, default=Path("patterns"),
                     help="output folder (default: ./patterns)")
@@ -764,8 +1031,8 @@ def main(argv=None):
 
     args.out.mkdir(parents=True, exist_ok=True)
     try:
-        out_path, s = convert(args.file, args.out, markers=not args.no_photo_markers,
-                              photo_urls=photo_urls, photo_title=photo_title, referer=referer)
+        out_path, s, data = convert(args.file, args.out, markers=not args.no_photo_markers,
+                                    photo_urls=photo_urls, photo_title=photo_title, referer=referer)
     except Exception as e:
         print(f"[FAIL] {args.file.name}: {e}", file=sys.stderr)
         return 1
@@ -776,8 +1043,7 @@ def main(argv=None):
               f"expansions; the expansions were listed under them")
     if args.pdf:
         try:
-            pdf_path = write_pdf(out_path.read_text(encoding="utf-8"), args.out,
-                                 out_path.with_suffix(".pdf"))
+            pdf_path = render_pdf(data, args.out, out_path.with_suffix(".pdf"))
         except ImportError:
             print("[FAIL] --pdf needs reportlab:  pip install reportlab", file=sys.stderr)
             return 1
