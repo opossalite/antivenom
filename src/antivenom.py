@@ -1,46 +1,46 @@
 #!/usr/bin/env python3
 """
-antivenom.py - turn crochet pattern web pages (saved with the SingleFile browser
-extension) into plain-text Markdown files + a folder of extracted images, and
-optionally a nicely laid-out PDF.
+antivenom.py - turn a crochet pattern web page (saved with the SingleFile browser
+extension) into a Markdown file and a nicely laid-out PDF, with the images pulled
+out into a subfolder.
+
+Setup (once)
+------------
+    pip install beautifulsoup4 lxml reportlab
 
 Usage
 -----
-    pip install beautifulsoup4 lxml          # core
-    pip install reportlab                    # only needed for --pdf
-    python antivenom.py "Vulpes the fox.html" -o patterns/
-    python antivenom.py "Vulpes the fox.html" -o patterns/ --photos "Vulpes the fox.json"
-    python antivenom.py "Vulpes the fox.html" -o patterns/ --pdf     # also writes vulpes-the-fox.pdf
+    python antivenom.py vulpes-the-fox.html
 
-One page per run. Output layout:
+Put the saved page and its photos file side by side with the SAME name:
+
+    vulpes-the-fox.html     <- the saved page
+    vulpes-the-fox.json     <- step photos (optional; made by the browser-console snippet)
+
+The .json is picked up automatically when it sits next to the .html with the same
+name. Output goes to ./patterns/ (change with -o):
 
     patterns/
         vulpes-the-fox.md
-        vulpes-the-fox.pdf          (with --pdf)
-        images/
-            vulpes-the-fox/cover-01.jpg
-            vulpes-the-fox/measurements-01.jpg
-            vulpes-the-fox/step-01.png
-            ...
+        vulpes-the-fox.pdf
+        images/vulpes-the-fox/cover-01.jpg, measurements-01.jpg, step-01.png, ...
 
-The Markdown never contains base64 data: images are written to disk and
-referenced as ![alt](images/<pattern>/<file>) at the spot where they appeared.
+Options: -o DIR (output folder), --label Row (say "Row 1:" instead of "Rnd 1:"),
+--no-pdf (Markdown only). Everything else is automatic. One page per run; to do
+several:   for f in *.html; do python antivenom.py "$f"; done
 
-The PDF only shows what the saved page actually contains: a cover page, an
-"at a glance" box (level / size / gauge ...), materials, abbreviations and the
-instructions as tables with the photos in place. Nothing is derived or invented -
-if the page has no materials list or difficulty, the PDF simply has none.
+The Markdown never contains base64 data: images are written to disk and referenced
+as ![alt](images/<pattern>/<file>) where they appeared. The PDF only shows what the
+saved page actually contains - nothing is derived or invented.
 
 What is (and isn't) in the saved HTML
 -------------------------------------
 Embedded in the file, so extracted:  cover photos, measurement photos, and any
 step photo that was expanded on the page when you saved it.
-NOT in the file: the per-step photos behind the little camera icons. Those are
+NOT in the file: the per-step photos behind the little camera icons. They are
 fetched from the site's server only when you click the icon, so the saved page
-never contains them. Where one existed, the Markdown gets a short text marker
-(--no-photo-markers leaves those out; the PDF never shows them). To get the
-photos, collect their URLs with the browser-console snippet and pass the
-resulting JSON with --photos.
+never contains them. The .json lists where they live; the script downloads them.
+Without a .json, the Markdown gets a short text marker where a photo existed.
 
 Photos JSON format
 ------------------
@@ -195,6 +195,7 @@ class ImageStore:
         self.seen = {}          # sha1 -> relative path
         self.counters = {}
         self.referer = None     # optional, taken from the photos JSON
+        self.failed = []        # (source, error) for step photos that couldn't be fetched
 
     def save(self, img_tag, kind):
         """Write an <img> with an embedded data: URI to disk.
@@ -225,7 +226,7 @@ class ImageStore:
         return rel
 
     def download(self, src, kind="step"):
-        """Get a step photo from a URL or a local file path (see --photos).
+        """Get a step photo from a URL or a local file path.
         Returns the relative path, or None on failure."""
         try:
             if re.match(r"https?://", src):
@@ -241,7 +242,7 @@ class ImageStore:
                 path = Path(src)
                 data, ext = path.read_bytes(), path.suffix.lower() or ".png"
         except Exception as e:
-            print(f"     [warn] couldn't get step photo {src}: {e}", file=sys.stderr)
+            self.failed.append((src, str(e)))
             return None
         return self.save_bytes(data, ext, kind)
 
@@ -316,7 +317,27 @@ def has_icon(row_li, alt):
     return any(i.get("alt") == alt for i in row_li.select(".line-icons img"))
 
 
-def instructions(ul, images, markers=True, photo_urls=None):
+
+def format_label(label, word):
+    """'2' -> 'Rnd 2', '4 to 5' / '2-46' -> 'Rnd 4 \u2013 5', anything else is left as is."""
+    m = re.fullmatch(r"(\d+)\s*(?:-|\u2013|to)\s*(\d+)", label.strip())
+    if m:
+        return f"{word} {m.group(1)} \u2013 {m.group(2)}"
+    if re.fullmatch(r"\d+[a-z]?", label.strip()):
+        return f"{word} {label.strip()}"
+    return label
+
+
+def normalize_count(text):
+    """Trailing stitch counts '(42)', '= 42', '= (42)' -> ' [42]' (already-bracketed stays)."""
+    m = (re.search(r"\s*=?\s*[(\[](\d+)[)\]]\s*\.?\s*$", text)
+         or re.search(r"\s*=\s*(\d+)\s*\.?\s*$", text))
+    if m and text[:m.start()].strip():
+        return f"{text[:m.start()]} [{m.group(1)}]"
+    return text
+
+
+def instructions(ul, images, markers=True, photo_urls=None, label_word="Rnd"):
     """Walk <ul id=ul_main> in document order.
     Returns (items, stats); every item is a dict with a "t" (type):
       section / sub / text      -> {"text"}
@@ -349,8 +370,8 @@ def instructions(ul, images, markers=True, photo_urls=None):
                 n = re.match(r"\d+", label)
                 if m and n and m.group(1) == n.group(0):
                     text = text[m.end():]
-                lab = label.replace("-", "\u2013") if re.fullmatch(r"\d+-\d+", label) else label
-                items.append({"t": "round", "label": lab, "text": text, "symbol": False})
+                items.append({"t": "round", "label": format_label(label, label_word),
+                              "text": normalize_count(text), "symbol": False})
             else:  # symbol-style note marker such as a star
                 items.append({"t": "round", "label": label, "text": text, "symbol": True})
         else:  # TextRow
@@ -496,7 +517,8 @@ def render_md(d):
 # --------------------------------------------------------------------------
 # one pattern file -> data model -> markdown (+ optional pdf)
 # --------------------------------------------------------------------------
-def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, referer=None):
+def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, referer=None,
+            label_word="Rnd"):
     raw = path.read_text(encoding="utf-8", errors="replace")
     soup = BeautifulSoup(raw, PARSER)
     del raw
@@ -550,16 +572,18 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
     ul = page.find(id="ul_main")
     stats = {"rows": 0, "photos_saved": 0, "photo_markers": 0, "mismatch": 0}
     if ul:
-        d["items"], stats = instructions(ul, images, markers, photo_urls)
+        d["items"], stats = instructions(ul, images, markers, photo_urls, label_word)
 
     out_path = out_dir / f"{slug}.md"
     out_path.write_text(render_md(d), encoding="utf-8")
     stats["images"] = len(images.seen)
+    stats["photos_failed"] = len(images.failed)
+    stats["first_error"] = images.failed[0] if images.failed else None
     return out_path, stats, d
 
 
 # --------------------------------------------------------------------------
-# PDF output (--pdf)
+# PDF output
 # --------------------------------------------------------------------------
 # (regular path, bold file, italic file, bold-italic file) - first set that exists wins
 _FONT_CANDIDATES = [
@@ -866,45 +890,41 @@ def render_pdf(d, base_dir, pdf_path):
     if items:
         story.append(CondPageBreak(3 * inch))
         heading("Instructions")
-    round_rows = []
 
-    def flush_rounds():
-        if not round_rows:
-            return
-        t = Table(round_rows, colWidths=[0.8 * inch, fw - 0.8 * inch])
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                               ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, pal["tint2"]]),
-                               ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#e2e2e2")),
-                               ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                               ("LEFTPADDING", (0, 0), (-1, -1), 6)]))
-        story.extend([t, Spacer(1, 7)])
-        round_rows.clear()
+    hexof = lambda c: "#%02x%02x%02x" % (int(c.red * 255), int(c.green * 255), int(c.blue * 255))
+    acc = hexof(pal["mid"])
+
+    def part_heading(text, big):
+        """UPPERCASE accent heading; a trailing "(...)" is set lighter, e.g. HEAD (in mint yarn)."""
+        m = re.match(r"^(.*?)\s*(\([^()]*\))\s*$", text)
+        main, extra = (m.group(1), m.group(2)) if m and m.group(1) else (text, "")
+        size = 16 if big else 12.5
+        markup = f'<font name="{bold}" size="{size}" color="{acc}">{px(main.upper())}</font>'
+        if extra:
+            markup += f' <font name="{reg}" size="10" color="{acc}">{px(extra)}</font>'
+        st = ParagraphStyle("part", parent=body, fontSize=size, leading=size + 5,
+                            spaceBefore=12 if big else 8, spaceAfter=4, keepWithNext=1)
+        story.append(CondPageBreak(1.5 * inch))
+        story.append(Paragraph(markup, st))
+
+    S["rnd"] = ParagraphStyle("rnd", parent=body, spaceAfter=2.5)
 
     i = 0
     while i < len(items):
         it = items[i]
         t = it["t"]
-        if t in ("round", "expanded") and not it.get("symbol"):
-            label = it["label"] if t == "round" else "\u21b3"
-            round_rows.append([Paragraph(f"<b>{_xml(label, uni)}</b>", S["label"]), P(it["text"], "cell")])
-            i += 1
-            continue
-        flush_rounds()
         if t == "section":
-            story.append(CondPageBreak(1.7 * inch))
-            band = Table([[Paragraph(px(it["text"]), S["band"])]], colWidths=[fw])
-            band.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), pal["dark"]),
-                                      ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                                      ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
-            story += [Spacer(1, 8), band, Spacer(1, 6)]
+            part_heading(it["text"], True)
         elif t == "sub":
-            story.append(CondPageBreak(1.4 * inch))
-            story.append(Paragraph(px(it["text"]), S["sub"]))
-            story.append(rule(0.6, pal["mid"], 5))
+            part_heading(it["text"], False)
         elif t == "text":
-            story += [P(it["text"]), Spacer(1, 5)]
-        elif t == "round":      # note bullet (star etc.) -> callout
-            story += [box([P(it["text"], "note")]), Spacer(1, 6)]
+            story += [P(it["text"]), Spacer(1, 3)]
+        elif t in ("round", "expanded") and not it.get("symbol"):
+            label = it["label"] if t == "round" else "\u21b3"
+            story.append(Paragraph(
+                f'<font name="{bold}" color="{acc}">{_xml(label, uni)}:</font> {px(it["text"])}', S["rnd"]))
+        elif t == "round":      # note bullet (star etc.) -> plain italic note
+            story += [P(it["text"], "note"), Spacer(1, 3)]
         elif t == "image":
             rels = []
             while i < len(items) and items[i]["t"] == "image":     # group neighbouring photos
@@ -914,7 +934,6 @@ def render_pdf(d, base_dir, pdf_path):
             continue
         # markers (missing photo / video notes) are not shown in the PDF
         i += 1
-    flush_rounds()
 
     # ---- page furniture ----
     def draw_cover(c):
@@ -994,29 +1013,23 @@ def render_pdf(d, base_dir, pdf_path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Convert ONE crochet pattern page saved with SingleFile into Markdown (and a PDF).")
+        description="Convert a saved crochet pattern page into Markdown + PDF. "
+                    "A <name>.json next to <name>.html supplies the step photos.")
     ap.add_argument("file", type=Path, help="the saved .html pattern page")
     ap.add_argument("-o", "--out", type=Path, default=Path("patterns"),
                     help="output folder (default: ./patterns)")
-    ap.add_argument("--photos", type=Path, metavar="JSON",
-                    help="photos JSON made by the browser-console snippet (default: "
-                         "<page>.photos.json next to the HTML file, if it exists)")
-    ap.add_argument("--no-photos", action="store_true",
-                    help="ignore any <page>.photos.json")
-    ap.add_argument("--pdf", action="store_true",
-                    help="also write a PDF next to the Markdown file (needs: pip install reportlab)")
-    ap.add_argument("--no-photo-markers", action="store_true",
-                    help="don't insert a text note where a (non-saved) step photo/video existed")
+    ap.add_argument("--label", default="Rnd", metavar="WORD",
+                    help='word in front of the round numbers: "Rnd" (default) or e.g. "Row"')
+    ap.add_argument("--no-pdf", action="store_true", help="write only the Markdown")
     args = ap.parse_args(argv)
 
+    if not args.file.exists():
+        print(f"[FAIL] {args.file} not found", file=sys.stderr)
+        return 1
+
     photo_urls, photo_title, referer = None, None, None
-    photos_json = args.photos
-    if not photos_json and not args.no_photos:
-        auto = args.file.with_suffix(".photos.json")
-        if auto.exists():
-            photos_json = auto
-            print(f"[info] using {auto.name}")
-    if photos_json:
+    photos_json = args.file.with_suffix(".json")
+    if photos_json.exists():
         try:
             d = json.loads(photos_json.read_text(encoding="utf-8"))
             photo_title = d.get("title")
@@ -1025,27 +1038,36 @@ def main(argv=None):
             for k, v in d["photos"].items():
                 # local paths in the JSON are relative to the JSON file itself
                 photo_urls[str(k)] = v if re.match(r"https?://", v) else str(photos_json.parent / v)
+            print(f"[info] using {photos_json.name} ({len(photo_urls)} step photos)")
         except Exception as e:
             print(f"[FAIL] couldn't read {photos_json}: {e}", file=sys.stderr)
             return 1
+    else:
+        print(f"[info] no {photos_json.name} next to the page - step photos will be marked, not inserted")
 
     args.out.mkdir(parents=True, exist_ok=True)
     try:
-        out_path, s, data = convert(args.file, args.out, markers=not args.no_photo_markers,
-                                    photo_urls=photo_urls, photo_title=photo_title, referer=referer)
+        out_path, s, data = convert(args.file, args.out, photo_urls=photo_urls,
+                                    photo_title=photo_title, referer=referer,
+                                    label_word=args.label)
     except Exception as e:
         print(f"[FAIL] {args.file.name}: {e}", file=sys.stderr)
         return 1
     print(f"[ok] {out_path}  ({s['rows']} rows, {s['images']} images saved, "
           f"{s['photo_markers']} photo markers)")
+    if s["photos_failed"]:
+        src, err = s["first_error"]
+        print(f"[warn] {s['photos_failed']} step photo(s) couldn't be downloaded and are marked "
+              f"in the Markdown instead.\n       first failure: {src}\n       {err}", file=sys.stderr)
     if s["mismatch"]:
         print(f"     note: {s['mismatch']} collapsed row(s) differed from their "
               f"expansions; the expansions were listed under them")
-    if args.pdf:
+    if not args.no_pdf:
         try:
             pdf_path = render_pdf(data, args.out, out_path.with_suffix(".pdf"))
         except ImportError:
-            print("[FAIL] --pdf needs reportlab:  pip install reportlab", file=sys.stderr)
+            print("[FAIL] the PDF needs reportlab:  pip install reportlab   "
+                  "(the Markdown was still written; or use --no-pdf)", file=sys.stderr)
             return 1
         except Exception as e:
             print(f"[FAIL] couldn't write the PDF: {e}", file=sys.stderr)
