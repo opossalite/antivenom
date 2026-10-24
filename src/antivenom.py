@@ -25,6 +25,10 @@ name. Output goes to ./patterns/ (change with -o):
         vulpes-the-fox.pdf
         images/vulpes-the-fox/cover-01.jpg, measurements-01.jpg, step-01.png, ...
 
+Live progress is shown for every stage (with an estimated time left). The only timers are
+network timeouts (20 s) and a stop after 5 failed downloads in a row; photos are never resized
+and nothing else is cut off, so a big pattern simply takes as long as it takes (Ctrl+C stops it).
+
 Options: -o DIR (output folder), --label Row (say "Row 1:" instead of "Rnd 1:"),
 --no-pdf (Markdown only). Everything else is automatic. One page per run; to do
 several:   for f in *.html; do python antivenom.py "$f"; done
@@ -55,8 +59,10 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -67,6 +73,53 @@ try:  # lxml is faster and more forgiving; fall back to the stdlib parser
     PARSER = "lxml"
 except ImportError:  # pragma: no cover
     PARSER = "html.parser"
+
+DOWNLOAD_TIMEOUT = 20            # seconds a network operation may stall (connect / each read)
+MAX_FAILURES_IN_A_ROW = 5        # then stop trying (offline / blocked) instead of crawling on
+
+
+def _fmt_secs(t):
+    t = int(round(t))
+    return f"{t // 60}m {t % 60:02d}s" if t >= 60 else f"{t}s"
+
+
+class Progress:
+    """Live 'label done/total (eta)' line: redraws in place on a terminal, and prints
+    roughly every 10% when output is piped to a file."""
+
+    def __init__(self, label, total):
+        self.label, self.total, self.t0, self.done = label, total, time.monotonic(), 0
+
+    def _text(self, done):
+        txt = f"[info] {self.label} {done}/{self.total}"
+        if 0 < done < self.total:
+            left = (time.monotonic() - self.t0) / done * (self.total - done)
+            txt += f"  (about {_fmt_secs(left)} left)"
+        return txt
+
+    def update(self, done=None):
+        self.done = self.done + 1 if done is None else done
+        if sys.stderr.isatty():
+            print("\r" + self._text(self.done).ljust(78), end="", file=sys.stderr, flush=True)
+        elif self.total and self.done < self.total and self.done % max(5, self.total // 10) == 0:
+            print(self._text(self.done), file=sys.stderr, flush=True)
+
+    def finish(self, text=None):
+        took = _fmt_secs(time.monotonic() - self.t0)
+        msg = (text or f"[info] {self.label} {self.done}/{self.total}") + f"  [{took}]"
+        if sys.stderr.isatty():
+            print("\r" + msg.ljust(78), file=sys.stderr, flush=True)
+        else:
+            print(msg, file=sys.stderr, flush=True)
+
+
+def _status(msg, final=False):
+    """One-off status line (in place on a terminal)."""
+    if sys.stderr.isatty():
+        print("\r" + msg.ljust(78), end="\n" if final else "", file=sys.stderr, flush=True)
+    elif final:
+        print(msg, file=sys.stderr, flush=True)
+
 
 PHOTO_MARKER = "*[step photo not included in the saved page]*"
 VIDEO_MARKER = "*[video not included in the saved page]*"
@@ -196,6 +249,12 @@ class ImageStore:
         self.counters = {}
         self.referer = None     # optional, taken from the photos JSON
         self.failed = []        # (source, error) for step photos that couldn't be fetched
+        self.total = 0          # number of step photos we'll try to get (for the progress line)
+        self.progress = None
+        self.attempts = 0
+        self.downloaded = 0
+        self.fail_streak = 0
+        self.gave_up = False
 
     def save(self, img_tag, kind):
         """Write an <img> with an embedded data: URI to disk.
@@ -227,14 +286,23 @@ class ImageStore:
 
     def download(self, src, kind="step"):
         """Get a step photo from a URL or a local file path.
-        Returns the relative path, or None on failure."""
+        Returns the relative path, or None on failure. After MAX_FAILURES_IN_A_ROW
+        failures in a row it stops trying the rest (offline / blocked)."""
+        if self.gave_up:
+            self.failed.append((src, "skipped after repeated failures"))
+            return None
+        self.attempts += 1
+        if self.total:
+            if self.progress is None:
+                self.progress = Progress("downloading step photos", self.total)
+            self.progress.update(self.attempts)
         try:
             if re.match(r"https?://", src):
                 headers = {"User-Agent": "Mozilla/5.0"}
                 if self.referer:
                     headers["Referer"] = self.referer
                 req = urllib.request.Request(src, headers=headers)
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
                     data = r.read()
                     ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
                 ext = MIME_EXT.get(ctype) or Path(src.split("?")[0]).suffix.lower() or ".png"
@@ -242,8 +310,13 @@ class ImageStore:
                 path = Path(src)
                 data, ext = path.read_bytes(), path.suffix.lower() or ".png"
         except Exception as e:
-            self.failed.append((src, str(e)))
+            self.failed.append((src, str(e) or type(e).__name__))
+            self.fail_streak += 1
+            if self.fail_streak >= MAX_FAILURES_IN_A_ROW:
+                self.gave_up = True
             return None
+        self.fail_streak = 0
+        self.downloaded += 1
         return self.save_bytes(data, ext, kind)
 
 
@@ -534,6 +607,7 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
     slug = slugify(title)
     images = ImageStore(out_dir, slug)
     images.referer = referer
+    images.total = len(photo_urls or {})
     if photo_title and slugify(photo_title) != slug:
         print(f"[warn] the photos JSON is for '{photo_title}' but this page is "
               f"'{title}' - double-check you paired the right files", file=sys.stderr)
@@ -578,6 +652,10 @@ def convert(path, out_dir, markers=True, photo_urls=None, photo_title=None, refe
     out_path.write_text(render_md(d), encoding="utf-8")
     stats["images"] = len(images.seen)
     stats["photos_failed"] = len(images.failed)
+    stats["gave_up"] = images.gave_up
+    if images.progress:
+        images.progress.finish(f"[info] step photos: {images.downloaded} downloaded, "
+                               f"{len(images.failed)} failed")
     stats["first_error"] = images.failed[0] if images.failed else None
     return out_path, stats, d
 
@@ -663,7 +741,7 @@ def _xml(s, unicode_ok=True):
 
 
 def _load_image(path):
-    """PIL image as RGB(A) -> (BytesIO, w, h). Re-encodes so WebP etc. work."""
+    """PIL image as RGB(A) -> (BytesIO, w, h). Full resolution; re-encoded so WebP etc. work."""
     import io
     from PIL import Image as PILImage
     with PILImage.open(path) as im:
@@ -738,13 +816,13 @@ def render_pdf(d, base_dir, pdf_path):
         "cell": ParagraphStyle("cell", parent=body, leading=14),
         "label": ParagraphStyle("label", parent=body, fontName=bold, textColor=pal["dark"]),
         "h1": ParagraphStyle("h1", parent=body, fontName=bold, fontSize=19, leading=23,
-                             textColor=pal["dark"], spaceBefore=12, spaceAfter=2, keepWithNext=1),
+                             textColor=pal["dark"], spaceBefore=12, spaceAfter=2),
         "band": ParagraphStyle("band", parent=body, fontName=bold, fontSize=13, leading=17,
                                textColor=colors.white),
         "sub": ParagraphStyle("sub", parent=body, fontName=bold, fontSize=11.5, leading=15,
-                              textColor=pal["dark"], spaceBefore=8, spaceAfter=1, keepWithNext=1),
+                              textColor=pal["dark"], spaceBefore=8, spaceAfter=1),
         "cat": ParagraphStyle("cat", parent=body, fontName=bold, fontSize=9, leading=12,
-                              textColor=GREY, spaceBefore=6, spaceAfter=2, keepWithNext=1),
+                              textColor=GREY, spaceBefore=6, spaceAfter=2),
         "small": ParagraphStyle("small", parent=body, fontSize=8.5, leading=11.5, textColor=GREY),
         "note": ParagraphStyle("note", parent=body, fontName=italic),
     }
@@ -756,7 +834,6 @@ def render_pdf(d, base_dir, pdf_path):
 
     def rule(thickness, color, after):
         r = HRFlowable(width="100%", thickness=thickness, color=color, spaceBefore=1, spaceAfter=after)
-        r.keepWithNext = 1
         return r
 
     def heading(text, level="h1"):
@@ -775,6 +852,12 @@ def render_pdf(d, base_dir, pdf_path):
         t.setStyle(TableStyle(style))
         return t
 
+    total_imgs = (max(len(d["cover_imgs"]) - 1, 0)      # the first cover photo goes on the cover page
+                  + (len(d["measure"]["imgs"]) if d["measure"] else 0)
+                  + sum(1 for it in (d["items"] or []) if it["t"] == "image"))
+    placed = [0]
+    prep = Progress("preparing PDF photos", total_imgs) if total_imgs else None
+
     def photo_grid(rels, max_h=2.9 * inch):
         """Photos placed 2-up (a single photo is centred and a bit larger)."""
         paths = [base_dir / r for r in rels if (base_dir / r).exists()]
@@ -789,6 +872,8 @@ def render_pdf(d, base_dir, pdf_path):
         for p in paths:
             try:
                 cells.append(_fit_image(p, cell_w, mh))
+                placed[0] += 1
+                prep.update(placed[0])
             except Exception as e:
                 print(f"     [warn] PDF: couldn't place {p.name}: {e}", file=sys.stderr)
         for i in range(0, len(cells), per_row):
@@ -903,7 +988,7 @@ def render_pdf(d, base_dir, pdf_path):
         if extra:
             markup += f' <font name="{reg}" size="10" color="{acc}">{px(extra)}</font>'
         st = ParagraphStyle("part", parent=body, fontSize=size, leading=size + 5,
-                            spaceBefore=12 if big else 8, spaceAfter=4, keepWithNext=1)
+                            spaceBefore=12 if big else 8, spaceAfter=4)
         story.append(CondPageBreak(1.5 * inch))
         story.append(Paragraph(markup, st))
 
@@ -973,11 +1058,14 @@ def render_pdf(d, base_dir, pdf_path):
             c.setStrokeColor(pal["mid"])
             c.setLineWidth(5)
             c.roundRect(fx, frame_bottom, fwid, fh, 14, stroke=1, fill=1)
-            buf, w, h = _load_image(cover_paths[0])
-            pad = 14
-            sc = min((fwid - 2 * pad) / w, (fh - 2 * pad) / h)
-            iw, ih = w * sc, h * sc
-            c.drawImage(ImageReader(buf), fx + (fwid - iw) / 2, frame_bottom + (fh - ih) / 2, iw, ih)
+            try:
+                buf, w, h = _load_image(cover_paths[0])
+                pad = 14
+                sc = min((fwid - 2 * pad) / w, (fh - 2 * pad) / h)
+                iw, ih = w * sc, h * sc
+                c.drawImage(ImageReader(buf), fx + (fwid - iw) / 2, frame_bottom + (fh - ih) / 2, iw, ih)
+            except Exception as e:
+                print(f"     [warn] PDF: couldn't place the cover photo: {e}", file=sys.stderr)
         if pill:
             wtxt = max(c.stringWidth(p, bold, 12.5) for p in pill) + 28
             c.setFillColor(pal["dark"])
@@ -988,11 +1076,14 @@ def render_pdf(d, base_dir, pdf_path):
                 c.drawString(0.6 * inch + 14, 0.9 * inch + pill_h - 22 - 18 * n, p)
 
     def on_first(c, doc):
+        _status("[info] writing PDF: page 1")
         c.saveState()
         draw_cover(c)
         c.restoreState()
 
     def on_later(c, doc):
+        pages_done[0] = doc.page
+        _status(f"[info] writing PDF: page {doc.page}")
         c.saveState()
         c.setStrokeColor(colors.HexColor("#dddddd"))
         c.setLineWidth(0.5)
@@ -1004,11 +1095,23 @@ def render_pdf(d, base_dir, pdf_path):
         c.drawRightString(page_w - margin, 0.45 * inch, str(doc.page))
         c.restoreState()
 
-    doc = SimpleDocTemplate(str(pdf_path), pagesize=letter, leftMargin=margin, rightMargin=margin,
+    if prep:
+        prep.finish()
+    t_write = time.monotonic()
+    pages_done = [0]
+    tmp_path = pdf_path.with_name(pdf_path.name + ".partial")
+    doc = SimpleDocTemplate(str(tmp_path), pagesize=letter, leftMargin=margin, rightMargin=margin,
                             topMargin=0.75 * inch, bottomMargin=0.85 * inch, title=title,
                             author=d["designer"] or "")
-    doc.build(story, onFirstPage=on_first, onLaterPages=on_later)
+    try:
+        doc.build(story, onFirstPage=on_first, onLaterPages=on_later)
+        os.replace(tmp_path, pdf_path)
+        _status(f"[info] writing PDF: {doc.page} pages  [{_fmt_secs(time.monotonic() - t_write)}]", final=True)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
     return pdf_path
+
 
 
 def main(argv=None):
@@ -1046,6 +1149,8 @@ def main(argv=None):
         print(f"[info] no {photos_json.name} next to the page - step photos will be marked, not inserted")
 
     args.out.mkdir(parents=True, exist_ok=True)
+    t_start = time.monotonic()
+    print(f"[info] reading {args.file.name} ...", file=sys.stderr, flush=True)
     try:
         out_path, s, data = convert(args.file, args.out, photo_urls=photo_urls,
                                     photo_title=photo_title, referer=referer,
@@ -1059,6 +1164,9 @@ def main(argv=None):
         src, err = s["first_error"]
         print(f"[warn] {s['photos_failed']} step photo(s) couldn't be downloaded and are marked "
               f"in the Markdown instead.\n       first failure: {src}\n       {err}", file=sys.stderr)
+        if s["gave_up"]:
+            print(f"       (stopped trying after {MAX_FAILURES_IN_A_ROW} failures in a row - "
+                  f"check your connection and run it again)", file=sys.stderr)
     if s["mismatch"]:
         print(f"     note: {s['mismatch']} collapsed row(s) differed from their "
               f"expansions; the expansions were listed under them")
@@ -1073,6 +1181,7 @@ def main(argv=None):
             print(f"[FAIL] couldn't write the PDF: {e}", file=sys.stderr)
             return 1
         print(f"[ok] {pdf_path}")
+    print(f"[done] {_fmt_secs(time.monotonic() - t_start)}", file=sys.stderr)
     return 0
 
 
